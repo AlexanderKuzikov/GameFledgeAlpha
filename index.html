@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>НЕОН-РАЗЛОМ — полёт сквозь разлом</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#04060f;height:100%;font-family:'Segoe UI',Arial,sans-serif;color:#cfefff;user-select:none}
+  #c{display:block;width:100vw;height:100vh}
+  .overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(2,4,12,.72);backdrop-filter:blur(6px);text-align:center;z-index:10}
+  .hidden{display:none !important}
+  h1{font-size:64px;margin:0 0 8px;letter-spacing:8px;color:#7df9ff;text-shadow:0 0 24px #00e5ff,0 0 64px #0077ff}
+  h2{font-size:40px;margin:0 0 16px;letter-spacing:6px;color:#ff7df9;text-shadow:0 0 24px #ff00d4}
+  p{margin:6px 0;font-size:18px;opacity:.85}
+  .btn{margin-top:24px;padding:12px 42px;font-size:20px;letter-spacing:4px;color:#041016;background:linear-gradient(90deg,#00e5ff,#7df9ff);border:none;border-radius:30px;cursor:pointer;box-shadow:0 0 24px #00e5ff;transition:transform .15s}
+  .btn:hover{transform:scale(1.08)}
+  #hud{position:fixed;top:14px;left:0;right:0;display:flex;justify-content:space-around;z-index:5;font-size:20px;letter-spacing:2px;text-shadow:0 0 8px #00e5ff;pointer-events:none}
+  #hud span b{color:#7df9ff;font-size:26px}
+  #hint{position:fixed;bottom:12px;left:0;right:0;text-align:center;font-size:13px;opacity:.5;z-index:5;letter-spacing:2px;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud" class="hidden">
+  <span>СЧЁТ <b id="score">0</b></span>
+  <span>УРОВЕНЬ <b id="level">1</b></span>
+  <span>РЕКОРД <b id="best">0</b></span>
+</div>
+<div id="hint" class="hidden">WASD / стрелки — движение · мышь — тоже · P — пауза · M — звук</div>
+
+<div id="menu" class="overlay">
+  <h1>НЕОН-РАЗЛОМ</h1>
+  <p>Пилотируй искру сквозь ломающийся неоновый тоннель.</p>
+  <p>Пролетай в разрывы стен, собирай сферы, не врезайся.</p>
+  <button class="btn" id="startBtn">СТАРТ</button>
+</div>
+
+<div id="pause" class="overlay hidden">
+  <h2>ПАУЗА</h2>
+  <p>Нажми P, чтобы продолжить</p>
+  <button class="btn" id="resumeBtn">ДАЛЬШЕ</button>
+</div>
+
+<div id="over" class="overlay hidden">
+  <h2>РАЗЛОМ ПОГЛОТИЛ ТЕБЯ</h2>
+  <p>Счёт: <b id="finalScore">0</b> · Рекорд: <b id="finalBest">0</b></p>
+  <button class="btn" id="restartBtn">ЕЩЁ РАЗ</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+"use strict";
+if (typeof THREE === "undefined") {
+  document.getElementById('menu').innerHTML = '<h1>Ошибка</h1><p>Не удалось загрузить three.js (нужен интернет для CDN).</p>';
+  return;
+}
+
+// ---------- DOM ----------
+const $ = id => document.getElementById(id);
+const hud=$('hud'), hint=$('hint'), menu=$('menu'), pauseEl=$('pause'), overEl=$('over');
+
+// ---------- Audio (WebAudio, без файлов) ----------
+let AC=null, muted=false, engineOsc=null, engineGain=null;
+function audio(){ if(!AC){ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } return AC; }
+function startEngine(){
+  const ac=audio(); if(!ac||muted) return;
+  engineOsc=ac.createOscillator(); engineGain=ac.createGain();
+  engineOsc.type='sawtooth'; engineOsc.frequency.value=55;
+  engineGain.gain.value=0.04;
+  const f=ac.createBiquadFilter(); f.type='lowpass'; f.frequency.value=400;
+  engineOsc.connect(f); f.connect(engineGain); engineGain.connect(ac.destination);
+  engineOsc.start();
+}
+function stopEngine(){ if(engineOsc){ try{engineOsc.stop();}catch(e){} engineOsc=null; } }
+function blip(freq,dur,type,vol){
+  const ac=audio(); if(!ac||muted) return;
+  const o=ac.createOscillator(), g=ac.createGain();
+  o.type=type||'sine'; o.frequency.value=freq;
+  g.gain.setValueAtTime(vol||0.12, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime+dur);
+  o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime+dur);
+}
+function boom(){
+  const ac=audio(); if(!ac||muted) return;
+  const len=ac.sampleRate*0.5, buf=ac.createBuffer(1,len,ac.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/len,2);
+  const s=ac.createBufferSource(), g=ac.createGain();
+  s.buffer=buf; g.gain.value=0.4; s.connect(g); g.connect(ac.destination); s.start();
+}
+
+// ---------- Three.js ----------
+const TUNNEL_R=10, SEG_LEN=24, SEGS=26, GAP_R=9; // радиус тоннеля, длина секции, число секций
+const scene=new THREE.Scene();
+scene.fog=new THREE.Fog(0x04060f, 30, SEG_LEN*SEGS*0.9);
+const camera=new THREE.PerspectiveCamera(80, innerWidth/innerHeight, 0.1, 500);
+camera.position.set(0,0,8);
+const renderer=new THREE.WebGLRenderer({canvas:$('c'), antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+scene.add(new THREE.AmbientLight(0x334466,1.2));
+const pl=new THREE.PointLight(0x00e5ff,1.6,60); pl.position.set(0,0,4); scene.add(pl);
+
+// Тоннель — набор колец + продольные рёбра
+const rings=[];
+const ringGeo=new THREE.TorusGeometry(TUNNEL_R,0.12,8,48);
+let hue=0.52;
+for(let i=0;i<SEGS;i++){
+  const m=new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({color:new THREE.Color().setHSL(hue,1,0.55), transparent:true, opacity:0.8}));
+  m.position.z=-i*SEG_LEN; scene.add(m); rings.push(m);
+}
+const rails=new THREE.Group();
+for(let i=0;i<12;i++){
+  const a=i/12*Math.PI*2;
+  const g=new THREE.CylinderGeometry(0.05,0.05,SEG_LEN*SEGS,4,1,true);
+  const m=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:0x224466,transparent:true,opacity:0.5}));
+  m.rotation.x=Math.PI/2;
+  m.position.set(Math.cos(a)*TUNNEL_R, Math.sin(a)*TUNNEL_R, -SEG_LEN*SEGS/2);
+  rails.add(m);
+}
+scene.add(rails);
+
+// Корабль — игла
+const ship=new THREE.Mesh(new THREE.ConeGeometry(0.5,2.2,8), new THREE.MeshStandardMaterial({color:0x7df9ff, emissive:0x00aacc, emissiveIntensity:1.2, metalness:0.6, roughness:0.3}));
+ship.rotation.x=-Math.PI/2; ship.position.z=4; scene.add(ship);
+const glow=new THREE.Mesh(new THREE.SphereGeometry(0.9,16,12), new THREE.MeshBasicMaterial({color:0x00e5ff, transparent:true, opacity:0.25}));
+glow.position.copy(ship.position); scene.add(glow);
+
+// Препятствия — секторы-стены, перекрывающие всё кольцо кроме разрыва
+const obstacles=[]; // {mesh, z, gapAngle}
+function spawnObstacle(z){
+  const gap=Math.random()*Math.PI*2;
+  // стена покрывает 3/4 диска; свободный сектор (четверть) центрирован у gap
+  const geo=new THREE.CircleGeometry(TUNNEL_R-0.2, 40, gap+Math.PI/4, Math.PI*1.5);
+  const m=new THREE.Mesh(geo, new THREE.MeshStandardMaterial({color:0xff2277, emissive:0xaa0044, emissiveIntensity:1, roughness:0.4, side:THREE.DoubleSide, transparent:true, opacity:0.55}));
+  m.position.z=z;
+  scene.add(m);
+  obstacles.push({mesh:m, z:z, gapAngle:gap, passed:false});
+}
+// сферы
+const pickups=[];
+const pkGeo=new THREE.IcosahedronGeometry(0.55,0);
+function spawnPickup(z){
+  const a=Math.random()*Math.PI*2, r=Math.random()*(TUNNEL_R-3);
+  const m=new THREE.Mesh(pkGeo, new THREE.MeshStandardMaterial({color:0xffe066, emissive:0xcc9900, emissiveIntensity:1.4, roughness:0.3}));
+  m.position.set(Math.cos(a)*r, Math.sin(a)*r, z);
+  scene.add(m); pickups.push(m);
+}
+for(let i=0;i<8;i++) spawnObstacle(-120 - i*70);
+for(let i=0;i<14;i++) spawnPickup(-80 - i*45);
+
+// Звёздный шлейф (частицы-полосы)
+const starN=400, starPos=new Float32Array(starN*3);
+for(let i=0;i<starN;i++){
+  const a=Math.random()*Math.PI*2, r=TUNNEL_R+Math.random()*10;
+  starPos[i*3]=Math.cos(a)*r; starPos[i*3+1]=Math.sin(a)*r; starPos[i*3+2]=-Math.random()*400;
+}
+const starGeo=new THREE.BufferGeometry();
+starGeo.setAttribute('position', new THREE.BufferAttribute(starPos,3));
+const stars=new THREE.Points(starGeo, new THREE.PointsMaterial({color:0x88ccff,size:0.35}));
+scene.add(stars);
+
+// Взрывные частицы
+let burst=null;
+function explode(color){
+  const n=120, p=new Float32Array(n*3), v=[];
+  for(let i=0;i<n;i++){
+    p[i*3]=ship.position.x; p[i*3+1]=ship.position.y; p[i*3+2]=ship.position.z;
+    v.push(new THREE.Vector3((Math.random()-0.5)*20,(Math.random()-0.5)*20,(Math.random()-0.5)*20));
+  }
+  const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.BufferAttribute(p,3));
+  burst={pts:new THREE.Points(g,new THREE.PointsMaterial({color:color,size:0.5})), v:v, life:1};
+  scene.add(burst.pts);
+}
+
+// ---------- Состояние ----------
+let state='menu', score=0, best=+(localStorage.getItem('neon_best')||0), level=1, speed=40, t=0;
+const shipPos=new THREE.Vector2(0,0), shipTarget=new THREE.Vector2(0,0);
+const keys={};
+addEventListener('keydown',e=>{
+  keys[e.code]=true;
+  if(e.code==='KeyP'||e.code==='Escape') togglePause();
+  if(e.code==='KeyM'){ muted=!muted; if(muted) stopEngine(); else if(state==='play') startEngine(); }
+  if(e.code==='Enter' && state!=='play') startGame();
+});
+addEventListener('keyup',e=>keys[e.code]=false);
+let mouseActive=false;
+addEventListener('mousemove',e=>{
+  if(state!=='play') return;
+  mouseActive=true;
+  shipTarget.set((e.clientX/innerWidth-0.5)*2*(TUNNEL_R-2), -(e.clientY/innerHeight-0.5)*2*(TUNNEL_R-2));
+});
+addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); });
+
+function resetWorld(){
+  obstacles.forEach(o=>{scene.remove(o.mesh); o.mesh.geometry.dispose();}); obstacles.length=0;
+  pickups.forEach(p=>scene.remove(p)); pickups.length=0;
+  for(let i=0;i<8;i++) spawnObstacle(-120 - i*70);
+  for(let i=0;i<14;i++) spawnPickup(-80 - i*45);
+  score=0; level=1; speed=40; t=0; shipPos.set(0,0); shipTarget.set(0,0);
+  ship.visible=true; glow.visible=true;
+  scene.fog.color.setHSL(hue,0.8,0.04);
+}
+function startGame(){
+  if(state==='play') return;
+  resetWorld();
+  state='play';
+  menu.classList.add('hidden'); overEl.classList.add('hidden'); pauseEl.classList.add('hidden');
+  hud.classList.remove('hidden'); hint.classList.remove('hidden');
+  audio() && AC.resume && AC.resume();
+  stopEngine(); startEngine();
+}
+function togglePause(){
+  if(state==='play'){ state='pause'; pauseEl.classList.remove('hidden'); stopEngine(); }
+  else if(state==='pause'){ state='play'; pauseEl.classList.add('hidden'); startEngine(); }
+}
+function gameOver(){
+  state='over'; boom(); explode(0xff4477); stopEngine(); ship.visible=false; glow.visible=false;
+  best=Math.max(best,Math.floor(score)); localStorage.setItem('neon_best',best);
+  $('finalScore').textContent=Math.floor(score); $('finalBest').textContent=best;
+  setTimeout(()=>overEl.classList.remove('hidden'), 900);
+}
+$('startBtn').onclick=startGame; $('restartBtn').onclick=startGame; $('resumeBtn').onclick=togglePause;
+$('best').textContent=best;
+
+// ---------- Игровой цикл ----------
+const clock=new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=Math.min(clock.getDelta(),0.05);
+  if(state==='play'){
+    t+=dt; score+=dt*speed*0.5;
+    const nl=1+Math.floor(score/300);
+    if(nl!==level){ level=nl; speed=40+level*8; hue=(hue+0.13)%1; blip(660+level*60,0.3,'square',0.1); }
+    // движение
+    const acc=60*dt;
+    if(keys['ArrowLeft']||keys['KeyA']) shipTarget.x-=acc;
+    if(keys['ArrowRight']||keys['KeyD']) shipTarget.x+=acc;
+    if(keys['ArrowUp']||keys['KeyW']) shipTarget.y+=acc;
+    if(keys['ArrowDown']||keys['KeyS']) shipTarget.y-=acc;
+    const len=shipTarget.length(), maxR=TUNNEL_R-1.8;
+    if(len>maxR) shipTarget.multiplyScalar(maxR/len);
+    shipPos.lerp(shipTarget,1-Math.pow(0.001,dt));
+    ship.position.x=shipPos.x; ship.position.y=shipPos.y;
+    ship.rotation.z=THREE.MathUtils.lerp(ship.rotation.z,-(shipTarget.x-shipPos.x)*0.3,0.1);
+    glow.position.copy(ship.position);
+    glow.material.opacity=0.2+Math.sin(t*8)*0.08;
+    if(engineOsc) engineOsc.frequency.value=55+speed*0.5;
+    pl.position.set(shipPos.x,shipPos.y,4);
+    pl.color.setHSL(hue,1,0.6);
+    // тоннель крутится и пульсирует
+    rails.rotation.z+=dt*0.3;
+    rings.forEach((r,i)=>{
+      r.position.z+=speed*dt;
+      if(r.position.z>SEG_LEN) r.position.z-=SEG_LEN*SEGS;
+      const s=1+Math.sin(t*3+i*0.5)*0.03; r.scale.set(s,s,1);
+    });
+    const pos=starGeo.attributes.position.array;
+    for(let i=0;i<starN;i++){ pos[i*3+2]+=speed*dt*1.5; if(pos[i*3+2]>8) pos[i*3+2]-=400; }
+    starGeo.attributes.position.needsUpdate=true;
+    // препятствия
+    for(let i=obstacles.length-1;i>=0;i--){
+      const o=obstacles[i];
+      o.mesh.position.z+=speed*dt;
+      if(o.mesh.position.z>12){ scene.remove(o.mesh); o.mesh.geometry.dispose(); obstacles.splice(i,1); spawnObstacle(-SEG_LEN*SEGS*0.85); continue; }
+      if(!o.passed && o.mesh.position.z>ship.position.z-1 && o.mesh.position.z<ship.position.z+1){
+        o.passed=true;
+        const shipA=Math.atan2(shipPos.y,shipPos.x);
+        let d=((shipA-o.gapAngle)%(Math.PI*2)+Math.PI*3)%(Math.PI*2)-Math.PI;
+        // разрыв дуги шириной ~PI/2; безопасно, если в пределах разрыва
+        if(Math.abs(d)>Math.PI/4){ gameOver(); break; }
+        else { blip(880,0.15,'sine',0.08); score+=25; }
+      }
+    }
+    // сферы
+    for(let i=pickups.length-1;i>=0;i--){
+      const p=pickups[i]; p.position.z+=speed*dt; p.rotation.x+=dt*2; p.rotation.y+=dt*3;
+      if(p.position.z>12){ scene.remove(p); pickups.splice(i,1); spawnPickup(-SEG_LEN*SEGS*0.8); continue; }
+      if(p.position.distanceTo(ship.position)<1.6){
+        scene.remove(p); pickups.splice(i,1); spawnPickup(-SEG_LEN*SEGS*0.8);
+        score+=50; blip(1320,0.2,'triangle',0.12);
+      }
+    }
+    // цвет тоннеля по уровню
+    rings.forEach((r,i)=>r.material.color.setHSL((hue+i/SEGS*0.15)%1,1,0.55));
+    $('score').textContent=Math.floor(score);
+    $('level').textContent=level;
+    $('best').textContent=best;
+  }
+  if(burst){
+    burst.life-=dt*1.2;
+    const a=burst.pts.geometry.attributes.position.array;
+    for(let i=0;i<burst.v.length;i++){
+      a[i*3]+=burst.v[i].x*dt; a[i*3+1]+=burst.v[i].y*dt; a[i*3+2]+=burst.v[i].z*dt+speed*dt*0.3;
+    }
+    burst.pts.geometry.attributes.position.needsUpdate=true;
+    burst.pts.material.opacity=Math.max(burst.life,0); burst.pts.material.transparent=true;
+    if(burst.life<=0){ scene.remove(burst.pts); burst=null; }
+  }
+  if(state==='menu'){ camera.position.x=Math.sin(t*0.3)*4; camera.position.y=Math.cos(t*0.2)*3; t+=dt; rings.forEach(r=>r.position.z+=8*dt); rings.forEach(r=>{if(r.position.z>SEG_LEN)r.position.z-=SEG_LEN*SEGS;}); }
+  camera.lookAt(ship.position.x*0.4, ship.position.y*0.4, -30);
+  renderer.render(scene,camera);
+}
+animate();
+})();
+</script>
+</body>
+</html>
